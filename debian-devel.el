@@ -23,31 +23,33 @@
 ;; 
 
 ;;; Code:
-(require 'comint)
-(require 'bui)
-(require 'dash)
-(require 'f)
-(require 's)
-(require 'parsec)
+
 (eval-when-compile
   (require 'cl-lib))
 (require 'aio)
-(require 'request)
-(require 'url)
+(require 'bui)
+(require 'comint)
+(require 'dash)
+(require 'f)
 (require 'magit)
+(require 'request)
+(require 's)
 (require 'transient)
+(require 'url)
+
+(require 'dd-deb822)
 
 (defun dd--packages-root ()
+  "The directory into which packages are cloned.
+
+TODO: Stop hardcoding this."
   (f-full "~/debian/packages"))
 
 (defun dd--build-area ()
-  (f-full "~/debian/build-area"))
+  "The directory into which .changes files are placed.
 
-(defmacro dd-with-default-dir (dir &rest body)
-  "Invoke in DIR the BODY."
-  (declare (debug t) (indent 1))
-  `(let ((default-directory ,dir))
-     ,@body))
+TODO: Stop hardcoding this."
+  (f-full "~/debian/build-area"))
 
 (cl-defsubst dd--ensure-package (dir)
   "Ensure that DIR is non-nil."
@@ -56,15 +58,18 @@
     (error "No package found")))
 
 (cl-defun dd-find-package (&optional (dir default-directory))
-  (f--traverse-upwards (f-dir? (f-expand "debian" it)) dir))
+  "Look upward from DIR to find something that looks like a
+Debian package."
+  (f--traverse-upwards (f-exists? (f-expand "debian/control" it)) dir))
 
 (defmacro dd-with-package-dir (dir &rest body)
-  "Invoke in DIR the BODY."
+  "Invoke BODY in the root of the package containing DIR."
   (declare (debug t) (indent 1))
   `(let ((default-directory (dd--ensure-package (dd-find-package ,dir))))
      ,@body))
 
 (cl-defun dd-get-package-name (&optional (dir default-directory))
+  "Get the name of the package containing DIR."
   (with-temp-buffer
     (insert-file-contents-literally
      (f-expand "debian/control" (dd--ensure-package (dd-find-package dir))))
@@ -74,84 +79,111 @@
       (line-end-position)))))
 
 (defun dd-find-named-package (package-name)
+  "Find an existing checkout of PACKAGE-NAME."
   (interactive "sPackage: ")
   (-first-item
    (f--directories
     (dd--packages-root)
     (and (s-equals? (f-filename it) package-name)
-         (f-dir? (f-expand "debian" it))))))
+         (f-exists? (f-expand "debian/control" it)))
+    t)))
 
 (aio-defun dd-gbp-clone (package-name)
+  "Clone PACKAGE-NAME."
   (interactive "sPackage: ")
   (let ((dir (f-expand package-name (dd--packages-root))))
     (aio-await
      (dd-aio-run-in-comint
       (s-concat "dd-clone: " package-name)
-      "gbp" "clone " (s-concat "vcsgit:" package-name) dir))
+      "gbp" "clone" (s-concat "vcsgit:" package-name) dir))
     dir))
 
 (aio-defun dd-clone-package (package-name)
-  "Clone a package, or switch to the existing clone.
-
-PACKAGE-NAME: the package to clone."
+  "Clone PACKAGE-NAME, or find an existing clone."
   (interactive "sPackage: ")
   (dired
    (or (dd-find-named-package package-name)
-       (aio-await (dd-debcheckout package-name)))))
+       (aio-await (dd-gbp-clone package-name)))))
 
-(defun dd-lintian-brush ()
+(aio-defun dd-lintian-brush ()
+  "Run lintian-brush and log any commits made."
   (interactive)
-  (dd-with-package-dir nil
-    (let* ((prev-rev (magit-rev-parse "HEAD"))
-           (name (concat "dd-lintian-brush: " (f-abbrev default-directory)))
-           (proc (start-file-process
-                  name nil
-                  "lintian-brush" "--modern" "--uncertain")))
-      (set-process-sentinel
-       proc
-       (lambda (p _e)
-         (when (= 0 (process-exit-status p))
-           (magit-log-other
-            (list (concat prev-rev "..HEAD"))
-            '("--patch")
-            '("debian/"))))))))
+  (let ((prev-rev (magit-rev-parse "HEAD")))
+    (aio-await
+     (dd-with-package-dir nil
+       (dd-aio-run-in-comint
+        (s-concat "dd-lintian-brush: " (f-abbrev default-directory))
+        "lintian-brush" "--modern" "--uncertain")))
+    (magit-log-other
+     (list (s-concat prev-rev "..HEAD"))
+     '("--patch")
+     '("debian/"))))
 
-(defun dd-build-binary (&optional args)
-  "Run a binary build of the package."
-  (interactive (list (transient-args 'dd-build)))
+(defun dd-gbp-build (gbp-args)
+  "Run gbp buildpackage with default settings.
+
+GBP-ARGS: A list of strings to pass to gbp-buildpackage."
+  (interactive (list (dd--args-for-program 'gbp)))
   (dd-with-package-dir nil
-    (let ((name (concat "dd-sbuild: " (f-abbrev default-directory))))
+    (let ((name (s-concat "dd-gbp-buildpackage: " (f-abbrev default-directory))))
+      (apply #'dd-aio-run-in-comint
+             name "gbp" "buildpackage" gbp-args))))
+
+(defun dd-gbp-sbuild (gbp-args dbp-args sbuild-args profiles dbo)
+  "Run sbuild via gbp.
+
+GBP-ARGS: A list of strings to pass to gbp-buildpackage.
+DBP-ARGS: A list of strings to pass to dpkg-buildpackage.
+SBUILD-ARGS: A list of strings to pass to sbuild.
+PROFILES: The build profiles to activate.
+DBO: Options to pass in the DEB_BUILD_OPTIONS envvar."
+  (interactive (list (dd--args-for-program 'gbp)
+                     (dd--args-for-program 'dpkg-buildpackage)
+                     (dd--args-for-program 'sbuild)
+                     (dd--build-profiles)
+                     (dd--build-options)))
+  (dd-with-package-dir nil
+    (let* ((name (s-concat "dd-sbuild: " (f-abbrev default-directory)))
+           (args
+            (-concat
+             gbp-args
+             sbuild-args
+             (list (s-concat "--profiles=" profiles))
+             (--map (s-prepend "--debbuildopt=" it) dbp-args)))
+           (process-environment
+            (cons (s-concat "DEB_BUILD_OPTIONS=" dbo)
+                  process-environment)))
       (apply #'dd-aio-run-in-comint
              name "gbp" "buildpackage" "--git-builder=sbuild" args))))
 
-(defun dd-build-source (&optional args)
-  "Run a source build of the package."
-  (interactive (list (transient-args 'dd-build)))
-  (dd-with-package-dir nil
-    (let ((name (concat "dd-sbuild: " (f-abbrev default-directory))))
-      (apply #'dd-aio-run-in-comint
-             name "gbp" "buildpackage"
-             "--git-tag"
-             "--git-retag"
-             "--git-builder=dpkg-buildpackage"
-             "-nc" "-S" args))))
-
-(defun dd-push ()
+(defun dd-gbp-push ()
   (interactive)
   (dd-with-package-dir nil
-    (let ((name (concat "dd-gbp: " (f-abbrev default-directory))))
+    (let ((name (s-concat "dd-gbp: " (f-abbrev default-directory))))
       (dd-aio-run-in-comint name "gbp" "push"))))
+
+(defun dd-gbp-pull ()
+  (interactive)
+  (dd-with-package-dir nil
+    (let ((name (s-concat "dd-gbp: " (f-abbrev default-directory))))
+      (dd-aio-run-in-comint name "gbp" "pull"))))
+
+(defun dd-gbp-tag ()
+  (interactive)
+  (dd-with-package-dir nil
+    (let ((name (s-concat "dd-gbp: " (f-abbrev default-directory))))
+      (dd-aio-run-in-comint name "gbp" "tag"))))
 
 (defun dd-import-new-upstream ()
   (interactive)
   (dd-with-package-dir nil
-    (let ((name (concat "dd-gbp: " (f-abbrev default-directory))))
+    (let ((name (s-concat "dd-gbp: " (f-abbrev default-directory))))
       (dd-aio-run-in-comint name "gbp" "import-orig" "--uscan"))))
 
 (defun dd-changes-since-last ()
   (interactive)
   (request
-    (concat
+    (s-concat
      "https://api.ftp-master.debian.org/dsc_in_suite/unstable/"
      (url-hexify-string (dd-get-package-name)))
     :parser 'json-read
@@ -162,7 +194,7 @@ PACKAGE-NAME: the package to clone."
                              'string-greaterp
                              (--map (alist-get 'version it) data))))
          (magit-log-other
-          (list (concat "debian/" latest "..HEAD"))
+          (list (s-concat "debian/" latest "..HEAD"))
           '("--patch" "--irreversible-delete")
           '("debian/")))))))
 
@@ -184,13 +216,13 @@ PACKAGE-NAME: the package to clone."
 (defun dd-upload-changes (changes-file)
   "Upload a .changes file with dput."
   (interactive)
-  (let ((name (concat "dd-upload: " (f-abbrev changes-file))))
+  (let ((name (s-concat "dd-upload: " (f-abbrev changes-file))))
     (dd-aio-run-in-comint name "dput" changes-file)))
 
 (defun dd-sign-changes (changes-file)
   "Sign a .changes file with debsign."
   (interactive)
-  (let ((name (concat "dd-sign: " (f-abbrev changes-file))))
+  (let ((name (s-concat "dd-sign: " (f-abbrev changes-file))))
     (dd-aio-run-in-comint name "debsign" "--no-re-sign" changes-file)))
 
 (defun dd--changes->entry (changes-file)
@@ -198,10 +230,10 @@ PACKAGE-NAME: the package to clone."
     `((id . ,changes-file)
       (name . ,(f-filename changes-file))
       (file-name . ,changes-file)
-      (date . ,(cdr (assoc-string "Date" fields t)))
-      (dist . ,(cdr (assoc-string "Distribution" fields t)))
-      (arch . ,(cdr (assoc-string "Architecture" fields t)))
-      (signed . ,(cdr (assoc-string "*signed*" fields t))))))
+      (date . ,(file-attribute-modification-time (file-attributes changes-file)))
+      (dist . ,(alist-get 'distribution fields))
+      (arch . ,(alist-get 'architecture fields))
+      (signed . ,(alist-get '*signed* fields)))))
 
 (defun dd--changes-get-entries ()
   (-map #'dd--changes->entry
@@ -214,7 +246,7 @@ PACKAGE-NAME: the package to clone."
   :format '((name nil 40 t)
             (file-name bui-list-get-file-name 20 t)
             (date bui-list-get-time 20 t)
-            (dist nil 10 t)
+            (dist nil 20 t)
             (arch nil 25 t)
             (signed nil 5 t))
   :filter-predicates
@@ -261,72 +293,6 @@ PACKAGE-NAME: the package to clone."
   (interactive)
   (bui-get-display-entries 'dd-changes 'list))
 
-(defun dd-parse-changes (changes-file)
-  (parsec-with-input (f-read-text changes-file)
-    (parsec-or
-     (dd-deb822-file1-signed)
-     (dd-deb822-file1))))
-
-(cl-defsubst dd-deb822-file ()
-  (parsec-return (parsec-many (dd-deb822-para))
-    (parsec-eof)))
-
-(cl-defsubst dd-deb822-file1 ()
-  (parsec-return (dd-deb822-para)
-                 (parsec-eof)))
-
-(cl-defsubst dd-deb822-file1-signed ()
-  (cons
-   '("*signed*" . t)
-   (parsec-between
-    (dd-deb822-gpg-header)
-    (dd-deb822-gpg-trailer)
-    (dd-deb822-para))))
-
-(cl-defsubst dd-deb822-para ()
-  (parsec-return (parsec-many (dd-deb822-field))
-    (parsec-many (parsec-eol))))
-
-(cl-defsubst dd-deb822-field ()
-  (parsec-or
-   (parsec-between
-    (parsec-one-of ?\s ?\t)
-    (parsec-eol-or-eof)
-    (parsec-many-s (parsec-none-of ?\n ?\r)))
-   (cons
-    (parsec-return (parsec-many1-s (parsec-re "[!-9;-~]"))
-      (parsec-str ":")
-      (parsec-many (parsec-one-of ?\s ?\t)))
-    (parsec-return (parsec-many-s (parsec-none-of ?\n ?\r))
-      (parsec-eol-or-eof)))))
-
-(cl-defsubst dd-deb822-gpg-header ()
-  (parsec-and
-   (parsec-str "-----BEGIN PGP SIGNED MESSAGE-----")
-   (parsec-eol)
-   (dd-deb822-gpg-fields)
-   (parsec-eol)))
-
-(cl-defsubst dd-deb822-gpg-fields ()
-  (parsec-many
-    (parsec-and
-     (parsec-many1 (parsec-none-of ?- ?\n ?\r))
-     (parsec-eol))))
-
-(cl-defsubst dd-deb822-gpg-trailer ()
-  (parsec-and
-   (parsec-str "-----BEGIN PGP SIGNATURE-----")
-   (parsec-eol)
-   (dd-deb822-gpg-fields)
-   (parsec-eol)
-   (parsec-many
-    (parsec-and
-     (parsec-many (parsec-none-of ?- ?\n ?\r))
-     (parsec-eol)))
-   (parsec-str "-----END PGP SIGNATURE-----")
-   (parsec-eol)
-   (parsec-eof)))
-
 (defun dd-magit-debcommit (&optional args)
   (interactive (list (transient-args 'magit-commit)))
   (dd-with-package-dir
@@ -362,17 +328,28 @@ PACKAGE-NAME: the package to clone."
 (transient-append-suffix 'magit-commit "c"
   '("d" "debcommit" dd-magit-debcommit))
 
+(transient-append-suffix 'magit-tag "r"
+  '("g" "gbp tag" dd-gbp-tag))
+
+(transient-append-suffix 'magit-pull "e"
+  '("g" "gbp pull" dd-gbp-pull))
+
+(transient-append-suffix 'magit-push "e"
+  '("g" "gbp push" dd-gbp-push))
+
 (transient-define-prefix dd-dispatch ()
   "Invoke a command that acts on the Debian package of the visited file."
   ["Actions"
-   [("b" "Build" dd-build)
+   [("b" "gbp buildpackage" dd-build)
     ("c" "Log since last version" dd-changes-since-last)
     ("d" "dch" dd-dch-dispatch)
-    ("i" "Import" dd-import-new-upstream)
+    ("F" "gbp pull" dd-gbp-pull)
+    ("i" "gbp import-orig" dd-import-new-upstream)
     ("l" "Lintian Brush" dd-lintian-brush)
-    ("P" "Push" dd-push)
-    ("Q" "Patch queue" dd-gbp-pq)
+    ("P" "gbp push" dd-gbp-push)
+    ("Q" "gbp pq" dd-gbp-pq)
     ("s" "Switch / clone" dd-clone-package)
+    ("t" "gbp tag" dd-gbp-tag)
     ("u" "List .changes" dd-list-changes)]])
 
 (transient-define-prefix dd-gbp-pq ()
@@ -391,22 +368,117 @@ PACKAGE-NAME: the package to clone."
 (with-eval-after-load 'magit-mode
   (define-key magit-mode-map "Q" 'dd-gbp-pq))
 
+(defclass dd-infix ()
+  ((program :initarg :program))
+  "An infix argument for a specific program.
+
+This may be ignored if not applicable, or transformed if being
+passed through another program.
+
+Mix this class in with one of the other transient-* infix
+classes."
+  :abstract t)
+
+(defclass dd-option (transient-option dd-infix) ()
+  "An option for a specific program.")
+
+(defclass dd-switches (transient-switches dd-infix) ()
+  "Switches for a specific program.")
+
+(defclass dd-on-off-switch (dd-switches) ()
+  "A switch with --foo and --no-foo forms.")
+
+(cl-defmethod initialize-instance :after ((obj dd-on-off-switch) &rest _)
+  (pcase-let ((`(,arg-p . ,arg-s) (oref obj argument)))
+    (oset obj argument-format (s-concat arg-p "%s" arg-s))
+    (oset obj argument-regexp
+          (rx-to-string `(group ,arg-p (group (? "no-")) ,arg-s)))
+    (oset obj choices '("" "no-"))))
+
+(cl-defmethod transient-format-value ((obj dd-on-off-switch))
+  (with-slots (value argument argument-format) obj
+    (format (propertize argument-format
+                        'face (if value
+                                  'transient-value
+                                'transient-inactive-value))
+            (concat
+             (propertize "[" 'face 'transient-inactive-value)
+             (propertize "no-" 'face
+                         (if (s-equals? (format argument-format "no-") value)
+                             'transient-value
+                           'transient-inactive-value))
+             (propertize "]" 'face 'transient-inactive-value)))))
+
+(defun dd--args-for-program (program)
+  "Get the transient infix arguments for PROGRAM."
+  (--keep
+   (when (and (object-of-class-p it 'dd-infix)
+              (eq program (oref it program)))
+     (transient-infix-value it))
+   transient-current-suffixes))
+
 (transient-define-prefix dd-build ()
   :man-page "gbp-buildpackage"
+  ["git-buildpackage Arguments"
+   (dd-build:--git-ignore-branch)]
   [["dpkg-buildpackage Arguments"
-    ("-v" "Include changelogs since version" "--debbuildopt=-v" :class transient-option)]
+    ("-v" "Include changelogs since version" "-v"
+     :class dd-option :program dpkg-buildpackage)
+    (dd-build:--build-profiles)]
    ["sbuild Arguments"
-    (dd-build:--build-dep-resolver)]]
+    (dd-build:--build-dep-resolver)
+    (dd-build:--run-autopkgtest)]]
   ["gbp buildpackage"
-   ("b" "Binary (testing)" dd-build-binary)
-   ("s" "Source (upload)" dd-build-source)])
+   ("b" "Default" dd-gbp-build)
+   ("s" "Sbuild" dd-gbp-sbuild)])
+
+(transient-define-argument dd-build:--git-ignore-branch ()
+  :description "Ignore not running on the default branch"
+  :class 'dd-on-off-switch
+  :program 'gbp
+  :key "-gi"
+  :argument '("--git-" . "ignore-branch"))
 
 (transient-define-argument dd-build:--build-dep-resolver ()
   :description "Build-dep resolver"
-  :class 'transient-option
+  :class 'dd-option
+  :program 'sbuild
   :key "-r"
   :argument "--build-dep-resolver="
   :choices '("apt" "aptitude" "aspcud" "xapt" "null"))
+
+(transient-define-argument dd-build:--build-profiles ()
+  :description "Build profiles, comma-separated"
+  :class 'dd-option
+  :program nil
+  :key "-P"
+  :argument "--build-profiles=")
+
+(transient-define-argument dd-build:--run-autopkgtest ()
+  :description "Run autopkgtest after build"
+  :class 'dd-on-off-switch
+  :program 'sbuild
+  :key "-a"
+  :argument '("--" . "run-autopkgtest"))
+
+(defun dd--build-profiles ()
+  (or (oref
+       (--first
+        (eq (transient--suffix-command it)
+            'dd-build:--build-profiles)
+        transient-current-suffixes)
+       value)
+      ""))
+
+(defun dd--build-options ()
+  (let ((profiles (s-split "," (dd--build-profiles))))
+    (s-join
+     " "
+     (-concat
+      (when (-contains? profiles "nocheck")
+        '("nocheck"))
+      (when (-contains? profiles "nodoc")
+        '("nodoc"))))))
 
 (defun dd-dch (&optional args)
   "Invoke dch.
@@ -422,7 +494,8 @@ PACKAGE-NAME: the package to clone."
   ((argument :initarg :argument)))
 
 (cl-defmethod transient-infix-value ((obj dd-suffix-switch))
-  (and (eq this-command (transient--suffix-command obj))
+  (message "%S : %S" obj (transient-suffix-object))
+  (and (eq obj (transient-suffix-object))
        (oref obj argument)))
 
 (transient-define-prefix dd-dch-dispatch ()
